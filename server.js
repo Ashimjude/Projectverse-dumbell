@@ -6,15 +6,39 @@ const path = require('path');
 const db = require('./db/database');
 const { dbEvents } = require('./db/database');
 const { requireAuth, requirePageAuth } = require('./middleware/auth');
-const { startScheduler, sendSMS, notifyMember } = require('./cron/notifier');
+const { startScheduler, sendSMS, notifyMember, initSMS } = require('./cron/notifier');
 const hikvision = require('./services/hikvisionService');
+const fs = require('fs');
+
+const uploadsDir = path.join(__dirname, 'public', 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+function saveBase64Image(base64Data, filenamePrefix = 'logistics') {
+  if (!base64Data || !base64Data.startsWith('data:image/')) {
+    return null;
+  }
+  const matches = base64Data.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+  if (!matches || matches.length !== 3) {
+    return null;
+  }
+  const contentType = matches[1];
+  const extension = contentType.split('/')[1] || 'png';
+  const base64Content = matches[2];
+  const buffer = Buffer.from(base64Content, 'base64');
+  const filename = `${filenamePrefix}_${Date.now()}.${extension}`;
+  const filepath = path.join(uploadsDir, filename);
+  fs.writeFileSync(filepath, buffer);
+  return `/uploads/${filename}`;
+}
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 // ─── Middleware ──────────────────────────────────────────────
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(session({
   secret: process.env.SESSION_SECRET || 'gym-secret-key',
   resave: false,
@@ -77,12 +101,13 @@ app.get('/api/me', requireAuth, (req, res) => {
 // ═══════════════════════════════════════════════════════════
 
 app.get('/api/members', requireAuth, (req, res) => {
-  const { search, status } = req.query;
-  const members = db.getAllMembers(search || '', status || '');
-
-  // Add computed remaining days to each member
+  const search = req.query.search || '';
+  const status = req.query.status || '';
+  const members = db.getAllMembers(search, status);
+  
   const membersWithExpiry = members.map(m => {
-    const expiry = new Date(m.expiry_date);
+    if (!m.expiry_date) return { ...m, days_remaining: 0 };
+    const expiry = new Date(m.expiry_date + 'T00:00:00');
     const now = new Date();
     expiry.setHours(0, 0, 0, 0);
     now.setHours(0, 0, 0, 0);
@@ -110,27 +135,72 @@ app.get('/api/members/:id', requireAuth, (req, res) => {
 });
 
 app.post('/api/members', requireAuth, (req, res) => {
-  const { full_name, phone, email, address, join_date, duration_months, expiry_date, plan_type, notes } = req.body;
+  const { 
+    full_name, phone, email, address, join_date, duration_months, expiry_date, plan_type, notes, avatar_base64,
+    date_of_birth, gender, emergency_contact_name, emergency_contact_phone,
+    amount_paid_initial, payment_method, transaction_reference, payment_due_date
+  } = req.body;
 
   if (!full_name || !phone || !join_date || !duration_months) {
     return res.status(400).json({ error: 'Name, phone, join date, and duration are required.' });
   }
 
-  const computedExpiry = db.getExpiryDate(join_date, duration_months).toISOString().split('T')[0];
-  const finalExpiry = expiry_date || computedExpiry;
+  try {
+    let avatar_path = '';
+    if (avatar_base64) {
+      avatar_path = saveBase64Image(avatar_base64, 'avatar');
+    }
 
-  const member = db.addMember({
-    full_name, phone, email, address, join_date,
-    duration_months: parseInt(duration_months),
-    expiry_date: finalExpiry,
-    plan_type: plan_type || 'Monthly',
-    notes
-  });
+    const computedExpiry = db.getExpiryDate(join_date, duration_months).toISOString().split('T')[0];
+    const finalExpiry = expiry_date || computedExpiry;
 
-  // Sync to Hikvision automatically
-  hikvision.syncMemberToDevice(member);
+    const member = db.addMember({
+      full_name, phone, email, address, join_date,
+      duration_months: parseInt(duration_months),
+      expiry_date: finalExpiry,
+      plan_type: plan_type || 'Monthly',
+      notes,
+      avatar_path,
+      date_of_birth,
+      gender,
+      first_joining_date: join_date,
+      emergency_contact_name,
+      emergency_contact_phone,
+      is_active: 1
+    });
 
-  res.status(201).json(member);
+    let plan = db.db.prepare('SELECT id, regular_price FROM plans WHERE plan_name = ?').get(plan_type);
+    let planId = plan ? plan.id : null;
+    let price = plan ? plan.regular_price : 0;
+
+    const membershipDetails = {
+      start_date: join_date,
+      end_date: finalExpiry,
+      original_price: price,
+      discount_type: 'NONE',
+      discount_amount: 0,
+      final_payable_amount: price,
+      payment_due_date: payment_due_date || finalExpiry,
+      plan_name_snapshot: plan_type || 'Monthly',
+      notes: 'Initial membership on onboarding'
+    };
+
+    const paymentDetails = {
+      amount_paid: parseFloat(amount_paid_initial || 0),
+      payment_method: payment_method || 'Cash',
+      transaction_reference: transaction_reference || '',
+      notes: 'Initial onboarding payment'
+    };
+
+    const adminUser = req.session && req.session.adminUsername ? req.session.adminUsername : 'Admin';
+    db.createMembership(member.id, planId, membershipDetails, paymentDetails, adminUser);
+
+    hikvision.syncMemberToDevice(member);
+
+    res.status(201).json(member);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.put('/api/members/:id', requireAuth, (req, res) => {
@@ -140,54 +210,71 @@ app.put('/api/members/:id', requireAuth, (req, res) => {
     return res.status(404).json({ error: 'Member not found.' });
   }
 
-  const { full_name, phone, email, address, join_date, duration_months, expiry_date, plan_type, status, notes } = req.body;
+  const { 
+    full_name, phone, email, address, join_date, duration_months, expiry_date, plan_type, status, notes, avatar_base64,
+    date_of_birth, gender, emergency_contact_name, emergency_contact_phone, is_active
+  } = req.body;
 
-  const updatedJoinDate = join_date || existing.join_date;
-  const updatedDuration = duration_months ? parseInt(duration_months) : existing.duration_months;
-
-  let finalExpiry = existing.expiry_date;
-  if (expiry_date) {
-    finalExpiry = expiry_date;
-  } else if (join_date || duration_months) {
-    finalExpiry = db.getExpiryDate(updatedJoinDate, updatedDuration).toISOString().split('T')[0];
-  }
-
-  let finalStatus = status || existing.status;
-  if (finalExpiry) {
-    const expiryObj = new Date(finalExpiry);
-    expiryObj.setHours(0, 0, 0, 0);
-    const now = new Date();
-    now.setHours(0, 0, 0, 0);
-    
-    if (expiryObj >= now) {
-      finalStatus = 'active';
-    } else {
-      finalStatus = 'expired';
+  try {
+    let avatar_path = existing.avatar_path;
+    if (avatar_base64 !== undefined) {
+      if (existing.avatar_path && existing.avatar_path.startsWith('/uploads/')) {
+        const oldFilepath = path.join(__dirname, 'public', existing.avatar_path);
+        if (fs.existsSync(oldFilepath)) {
+          try { fs.unlinkSync(oldFilepath); } catch (e) {}
+        }
+      }
+      if (avatar_base64) {
+        avatar_path = saveBase64Image(avatar_base64, 'avatar');
+      } else {
+        avatar_path = '';
+      }
     }
+
+    const updatedJoinDate = join_date || existing.join_date;
+    const updatedDuration = duration_months ? parseInt(duration_months) : existing.duration_months;
+
+    let finalExpiry = existing.expiry_date;
+    if (expiry_date) {
+      finalExpiry = expiry_date;
+    } else if (join_date || duration_months) {
+      finalExpiry = db.getExpiryDate(updatedJoinDate, updatedDuration).toISOString().split('T')[0];
+    }
+
+    let finalStatus = status || existing.status;
+    const protectedNames = ['saurav kunwar', 'ashim pandey'];
+    if (protectedNames.includes(existing.full_name.toLowerCase()) || (full_name && protectedNames.includes(full_name.toLowerCase()))) {
+      finalStatus = 'active';
+    }
+
+    const member = db.updateMember(id, {
+      full_name: full_name || existing.full_name,
+      phone: phone || existing.phone,
+      email: email !== undefined ? email : existing.email,
+      address: address !== undefined ? address : existing.address,
+      join_date: updatedJoinDate,
+      duration_months: updatedDuration,
+      expiry_date: finalExpiry,
+      plan_type: plan_type || existing.plan_type,
+      status: finalStatus,
+      notes: notes !== undefined ? notes : existing.notes,
+      avatar_path,
+      member_code: existing.member_code,
+      date_of_birth: date_of_birth !== undefined ? date_of_birth : existing.date_of_birth,
+      gender: gender !== undefined ? gender : existing.gender,
+      first_joining_date: existing.first_joining_date,
+      emergency_contact_name: emergency_contact_name !== undefined ? emergency_contact_name : existing.emergency_contact_name,
+      emergency_contact_phone: emergency_contact_phone !== undefined ? emergency_contact_phone : existing.emergency_contact_phone,
+      is_active: is_active !== undefined ? parseInt(is_active) : existing.is_active
+    });
+
+    // Sync to Hikvision automatically
+    hikvision.syncMemberToDevice(member);
+
+    res.json(member);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-
-  const protectedNames = ['saurav kunwar', 'ashim pandey'];
-  if (protectedNames.includes(existing.full_name.toLowerCase()) || (full_name && protectedNames.includes(full_name.toLowerCase()))) {
-    finalStatus = 'active';
-  }
-
-  const member = db.updateMember(id, {
-    full_name: full_name || existing.full_name,
-    phone: phone || existing.phone,
-    email: email !== undefined ? email : existing.email,
-    address: address !== undefined ? address : existing.address,
-    join_date: updatedJoinDate,
-    duration_months: updatedDuration,
-    expiry_date: finalExpiry,
-    plan_type: plan_type || existing.plan_type,
-    status: finalStatus,
-    notes: notes !== undefined ? notes : existing.notes
-  });
-
-  // Sync to Hikvision automatically
-  hikvision.syncMemberToDevice(member);
-
-  res.json(member);
 });
 
 app.delete('/api/members/:id', requireAuth, (req, res) => {
@@ -202,8 +289,19 @@ app.delete('/api/members/:id', requireAuth, (req, res) => {
     return res.status(403).json({ error: 'Saurav Kunwar and Ashim Pandey are protected members and cannot be deleted.' });
   }
 
-  db.deleteMember(id);
-  res.json({ success: true, message: 'Member deleted.' });
+  try {
+    if (existing.avatar_path && existing.avatar_path.startsWith('/uploads/')) {
+      const filepath = path.join(__dirname, 'public', existing.avatar_path);
+      if (fs.existsSync(filepath)) {
+        try { fs.unlinkSync(filepath); } catch (e) {}
+      }
+    }
+
+    db.deleteMember(id);
+    res.json({ success: true, message: 'Member deleted.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -360,6 +458,412 @@ dbEvents.on('attendance', (data) => {
 });
 
 // ═══════════════════════════════════════════════════════════
+// LOGISTICS ROUTES
+// ═══════════════════════════════════════════════════════════
+
+app.get('/api/logistics', requireAuth, (req, res) => {
+  try {
+    const search = req.query.search || '';
+    const items = db.getAllLogistics(search);
+    res.json(items);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/logistics/transactions', requireAuth, (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const transactions = db.getLogisticsTransactions(limit);
+    res.json(transactions);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/logistics', requireAuth, (req, res) => {
+  const { name, price, quantity, image_base64 } = req.body;
+  if (!name || price === undefined) {
+    return res.status(400).json({ error: 'Name and price are required.' });
+  }
+
+  try {
+    let image_path = '';
+    if (image_base64) {
+      image_path = saveBase64Image(image_base64);
+    }
+
+    const item = db.addLogisticsItem({
+      name,
+      price: parseFloat(price),
+      quantity: parseInt(quantity) || 0,
+      image_path
+    });
+
+    if (item.quantity > 0) {
+      db.recordLogisticsTransaction(item.id, 'restock', item.quantity, item.price, 'Initial stock setup');
+    }
+
+    res.status(201).json(item);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/logistics/:id', requireAuth, (req, res) => {
+  const id = parseInt(req.params.id);
+  const existing = db.getLogisticsById(id);
+  if (!existing) {
+    return res.status(404).json({ error: 'Product not found.' });
+  }
+
+  const { name, price, quantity, image_base64 } = req.body;
+
+  try {
+    let image_path = existing.image_path;
+    if (image_base64) {
+      if (existing.image_path && existing.image_path.startsWith('/uploads/')) {
+        const oldFilepath = path.join(__dirname, 'public', existing.image_path);
+        if (fs.existsSync(oldFilepath)) {
+          try { fs.unlinkSync(oldFilepath); } catch (e) {}
+        }
+      }
+      image_path = saveBase64Image(image_base64);
+    }
+
+    const updatedQty = quantity !== undefined ? parseInt(quantity) : existing.quantity;
+    const prevQty = existing.quantity;
+
+    const item = db.updateLogisticsItem(id, {
+      name: name || existing.name,
+      price: price !== undefined ? parseFloat(price) : existing.price,
+      quantity: updatedQty,
+      image_path
+    });
+
+    if (updatedQty !== prevQty) {
+      const diff = updatedQty - prevQty;
+      const type = diff > 0 ? 'restock' : 'sale';
+      db.recordLogisticsTransaction(id, type, Math.abs(diff), item.price, 'Stock adjusted via edit');
+    }
+
+    res.json(item);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/logistics/:id', requireAuth, (req, res) => {
+  const id = parseInt(req.params.id);
+  const existing = db.getLogisticsById(id);
+  if (!existing) {
+    return res.status(404).json({ error: 'Product not found.' });
+  }
+
+  try {
+    if (existing.image_path && existing.image_path.startsWith('/uploads/')) {
+      const filepath = path.join(__dirname, 'public', existing.image_path);
+      if (fs.existsSync(filepath)) {
+        try { fs.unlinkSync(filepath); } catch (e) {}
+      }
+    }
+
+    db.deleteLogisticsItem(id);
+    res.json({ success: true, message: 'Product deleted.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/logistics/:id/sell', requireAuth, (req, res) => {
+  const id = parseInt(req.params.id);
+  const existing = db.getLogisticsById(id);
+  if (!existing) {
+    return res.status(404).json({ error: 'Product not found.' });
+  }
+
+  const { quantity, notes } = req.body;
+  const qtyToSell = parseInt(quantity);
+
+  if (isNaN(qtyToSell) || qtyToSell <= 0) {
+    return res.status(400).json({ error: 'Valid quantity is required.' });
+  }
+
+  if (qtyToSell > existing.quantity) {
+    return res.status(400).json({ error: `Not enough stock. Available: ${existing.quantity}` });
+  }
+
+  try {
+    const updatedQty = existing.quantity - qtyToSell;
+    db.updateLogisticsItem(id, {
+      name: existing.name,
+      price: existing.price,
+      quantity: updatedQty,
+      image_path: existing.image_path
+    });
+
+    db.recordLogisticsTransaction(id, 'sale', qtyToSell, existing.price, notes || 'Product sold');
+    res.json({ success: true, message: `${qtyToSell} units sold.`, available: updatedQty });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/logistics/:id/restock', requireAuth, (req, res) => {
+  const id = parseInt(req.params.id);
+  const existing = db.getLogisticsById(id);
+  if (!existing) {
+    return res.status(404).json({ error: 'Product not found.' });
+  }
+
+  const { quantity, notes } = req.body;
+  const qtyToAdd = parseInt(quantity);
+
+  if (isNaN(qtyToAdd) || qtyToAdd <= 0) {
+    return res.status(400).json({ error: 'Valid quantity is required.' });
+  }
+
+  try {
+    const updatedQty = existing.quantity + qtyToAdd;
+    db.updateLogisticsItem(id, {
+      name: existing.name,
+      price: existing.price,
+      quantity: updatedQty,
+      image_path: existing.image_path
+    });
+
+    db.recordLogisticsTransaction(id, 'restock', qtyToAdd, existing.price, notes || 'Stock replenishment');
+    res.json({ success: true, message: `${qtyToAdd} units added.`, available: updatedQty });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// PLANS & FINANCIALS ROUTES
+// ═══════════════════════════════════════════════════════════
+
+app.get('/api/plans', requireAuth, (req, res) => {
+  try {
+    res.json(db.getAllPlans());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/plans', requireAuth, (req, res) => {
+  const { plan_name, description, duration_value, duration_type, regular_price } = req.body;
+  if (!plan_name || !duration_value || isNaN(regular_price)) {
+    return res.status(400).json({ error: 'Plan name, duration, and price are required.' });
+  }
+  try {
+    const plan = db.addPlan({
+      plan_name: plan_name.trim(),
+      description: description || '',
+      duration_value: parseInt(duration_value),
+      duration_type: duration_type || 'MONTH',
+      regular_price: parseFloat(regular_price)
+    });
+    res.status(201).json(plan);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/plans/:id', requireAuth, (req, res) => {
+  try {
+    db.deletePlan(parseInt(req.params.id));
+    res.json({ success: true, message: 'Plan deleted.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Backward compatible package endpoints
+app.get('/api/packages', requireAuth, (req, res) => {
+  try {
+    const plans = db.getAllPlans();
+    const pkgs = plans.map(p => ({
+      id: p.id,
+      name: p.plan_name,
+      duration_months: p.duration_value,
+      price: p.regular_price
+    }));
+    res.json(pkgs);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/packages', requireAuth, (req, res) => {
+  const { name, duration_months, price } = req.body;
+  try {
+    const plan = db.addPlan({
+      plan_name: name.trim(),
+      description: 'Migrated package',
+      duration_value: parseInt(duration_months),
+      duration_type: 'MONTH',
+      regular_price: parseFloat(price)
+    });
+    res.status(201).json({
+      id: plan.id,
+      name: plan.plan_name,
+      duration_months: plan.duration_value,
+      price: plan.regular_price
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/packages/:id', requireAuth, (req, res) => {
+  try {
+    db.deletePlan(parseInt(req.params.id));
+    res.json({ success: true, message: 'Package deleted.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/members/:id/profile', requireAuth, (req, res) => {
+  try {
+    const profile = db.getMemberProfile(parseInt(req.params.id));
+    if (!profile) return res.status(404).json({ error: 'Member not found.' });
+    res.json(profile);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/members/:id/memberships', requireAuth, (req, res) => {
+  try {
+    const history = db.getMembershipHistory(parseInt(req.params.id));
+    res.json(history);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/members/:id/payments', requireAuth, (req, res) => {
+  try {
+    const payments = db.getPaymentHistory(parseInt(req.params.id));
+    res.json(payments);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/members/:id/renew', requireAuth, (req, res) => {
+  const memberId = parseInt(req.params.id);
+  const { 
+    plan_id, start_date, end_date, original_price, discount_type, discount_amount, 
+    final_payable_amount, payment_due_date, notes, amount_paid, payment_method, 
+    transaction_reference, payment_notes 
+  } = req.body;
+
+  if (!start_date || !end_date || isNaN(final_payable_amount)) {
+    return res.status(400).json({ error: 'Start date, end date, and final payable amount are required.' });
+  }
+
+  try {
+    let planName = 'Custom Plan';
+    if (plan_id) {
+      const plan = db.db.prepare('SELECT plan_name FROM plans WHERE id = ?').get(plan_id);
+      if (plan) planName = plan.plan_name;
+    }
+
+    const details = {
+      start_date,
+      end_date,
+      original_price: parseFloat(original_price || final_payable_amount),
+      discount_type: discount_type || 'NONE',
+      discount_amount: parseFloat(discount_amount || 0),
+      final_payable_amount: parseFloat(final_payable_amount),
+      payment_due_date: payment_due_date || end_date,
+      plan_name_snapshot: planName,
+      notes: notes || 'Membership renewal'
+    };
+
+    const paymentDetails = {
+      amount_paid: parseFloat(amount_paid || 0),
+      payment_method: payment_method || 'Cash',
+      transaction_reference: transaction_reference || '',
+      notes: payment_notes || 'Renewal payment'
+    };
+
+    const adminUser = req.session && req.session.adminUsername ? req.session.adminUsername : 'Admin';
+    const membershipId = db.renewMembership(memberId, plan_id, details, paymentDetails, adminUser);
+    
+    // Update main member expiration dates back to members table for UI
+    db.db.prepare('UPDATE members SET join_date = ?, duration_months = ?, expiry_date = ?, plan_type = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      .run(start_date, details.discount_type === 'PERCENT' ? 12 : 3, end_date, planName, memberId);
+
+    res.status(201).json({ success: true, membershipId });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/payments', requireAuth, (req, res) => {
+  const { member_id, membership_id, amount, payment_method, transaction_reference, notes } = req.body;
+  if (!member_id || !membership_id || isNaN(amount) || !payment_method) {
+    return res.status(400).json({ error: 'Member, membership, amount, and method are required.' });
+  }
+
+  try {
+    const adminUser = req.session && req.session.adminUsername ? req.session.adminUsername : 'Admin';
+    const receiptNum = db.recordPayment(parseInt(member_id), parseInt(membership_id), parseFloat(amount), {
+      payment_method,
+      transaction_reference,
+      notes
+    }, adminUser);
+    res.status(201).json({ success: true, receiptNum });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/payments/:id/reverse', requireAuth, (req, res) => {
+  const paymentId = parseInt(req.params.id);
+  const { reason } = req.body;
+  if (!reason) {
+    return res.status(400).json({ error: 'Reversal reason is required.' });
+  }
+
+  try {
+    const adminUser = req.session && req.session.adminUsername ? req.session.adminUsername : 'Admin';
+    db.reversePayment(paymentId, reason, adminUser);
+    res.json({ success: true, message: 'Payment reversed.' });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/memberships/:id/freeze', requireAuth, (req, res) => {
+  const membershipId = parseInt(req.params.id);
+  const { days, reason } = req.body;
+  if (!days || isNaN(days) || !reason) {
+    return res.status(400).json({ error: 'Days and reason are required.' });
+  }
+
+  try {
+    const adminUser = req.session && req.session.adminUsername ? req.session.adminUsername : 'Admin';
+    db.freezeMembership(membershipId, parseInt(days), reason, adminUser);
+    res.json({ success: true, message: 'Membership frozen.' });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/api/dues', requireAuth, (req, res) => {
+  try {
+    res.json(db.getOutstandingDues());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
 // HIKVISION ROUTES
 // ═══════════════════════════════════════════════════════════
 
@@ -496,6 +1000,149 @@ app.get('/api/hikvision/sync', requireAuth, async (req, res) => {
     res.json({ success: true, message: 'Sync complete', result });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── Aakash SMS Config Endpoints ────────────────────────────
+app.get('/api/sms/settings', requireAuth, (req, res) => {
+  const token = db.getSetting('aakash_sms_auth_token', '');
+  res.json({
+    token: token ? '********' : ''
+  });
+});
+
+app.post('/api/sms/settings', requireAuth, (req, res) => {
+  const { token } = req.body;
+  if (token !== undefined && token !== '********') {
+    db.setSetting('aakash_sms_auth_token', token);
+    initSMS(); // Re-initialize immediately!
+  }
+  res.json({ success: true, message: 'Aakash SMS Token saved successfully.' });
+});
+
+// ─── Aakash SMS Diagnostics ─────────────────────────────────
+app.get('/api/sms/diagnose', requireAuth, async (req, res) => {
+  try {
+    let publicIp = 'Unknown';
+    try {
+      const ipRes = await fetch('https://api.ipify.org?format=json', { signal: AbortSignal.timeout(3000) });
+      if (ipRes.ok) {
+        const ipData = await ipRes.json();
+        publicIp = ipData.ip;
+      }
+    } catch (e) {
+      publicIp = 'Offline or could not fetch IP';
+    }
+
+    const activeToken = db.getSetting('aakash_sms_auth_token', '') || process.env.AAKASH_SMS_AUTH_TOKEN || '';
+    const hasToken = !!activeToken;
+    const tokenPart = hasToken 
+      ? `${activeToken.substring(0, 6)}...${activeToken.slice(-4)}`
+      : 'Not Configured';
+
+    res.json({
+      publicIp,
+      configured: hasToken,
+      tokenPreview: tokenPart,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/sms/test-send', requireAuth, async (req, res) => {
+  const { phone } = req.body;
+  if (!phone) {
+    return res.status(400).json({ error: 'Phone number is required for test SMS.' });
+  }
+
+  const token = db.getSetting('aakash_sms_auth_token', '') || process.env.AAKASH_SMS_AUTH_TOKEN;
+  if (!token) {
+    return res.status(400).json({ error: 'Aakash SMS Auth Token is not configured.' });
+  }
+
+  try {
+    const body = {
+      auth_token: token,
+      to: phone,
+      text: 'Fit24 Gym Test: This is a diagnostic test message from your GymPro system!'
+    };
+    
+    const smsRes = await fetch('https://sms.aakashsms.com/sms/v3/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    
+    const data = await smsRes.json();
+    
+    if (!smsRes.ok || data.error) {
+      return res.status(400).json({
+        success: false,
+        error: data.message || 'Aakash SMS rejected the request.',
+        details: data
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Test SMS sent successfully!',
+      details: data
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message || 'Failed to connect to Aakash SMS API.'
+    });
+  }
+});
+
+// ─── Chatbot API Endpoint ────────────────────────────────────
+app.post('/api/chat', requireAuth, async (req, res) => {
+  const { messages } = req.body;
+  if (!messages || !Array.isArray(messages)) {
+    return res.status(400).json({ error: 'Messages array is required.' });
+  }
+
+  const mistralApiKey = process.env.MISTRAL_API_KEY ? process.env.MISTRAL_API_KEY.trim() : '';
+  if (!mistralApiKey) {
+    return res.status(400).json({ 
+      error: 'Mistral API Key is not configured in .env. Please configure MISTRAL_API_KEY in the server environment.' 
+    });
+  }
+
+  const agentId = process.env.MISTRAL_AGENT_ID ? process.env.MISTRAL_AGENT_ID.trim() : 'ag_019f9fef1481776097ed81bacbbca7fd';
+  const url = 'https://api.mistral.ai/v1/agents/completions';
+
+  try {
+    const apiResponse = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${mistralApiKey}`
+      },
+      body: JSON.stringify({
+        agent_id: agentId,
+        messages: messages
+      })
+    });
+
+    if (!apiResponse.ok) {
+      const errorText = await apiResponse.text();
+      console.error('[Chat API Error]:', errorText);
+      let errorJson;
+      try {
+        errorJson = JSON.parse(errorText);
+      } catch (e) {}
+      const errMsg = errorJson?.message || errorJson?.detail || errorText || 'Failed to retrieve response from Mistral AI agent.';
+      return res.status(apiResponse.status).json({ error: `Mistral API: ${errMsg}` });
+    }
+
+    const data = await apiResponse.json();
+    res.json(data);
+  } catch (err) {
+    console.error('[Chat API Error]:', err);
+    res.status(500).json({ error: err.message || 'Internal server error during chat.' });
   }
 });
 

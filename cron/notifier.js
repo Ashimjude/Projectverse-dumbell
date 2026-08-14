@@ -4,11 +4,25 @@ const hikvision = require('../services/hikvisionService');
 
 let aakashSmsToken = null;
 
+async function printPublicIP() {
+  try {
+    const res = await fetch('https://api.ipify.org?format=json');
+    if (res.ok) {
+      const data = await res.json();
+      console.log(`ℹ️  Public IP of this computer: ${data.ip}`);
+      console.log(`🔗 Make sure this IP (${data.ip}) is whitelisted in your Aakash SMS dashboard!\n`);
+    }
+  } catch (err) {
+    // Fail silently if network/DNS issues
+  }
+}
+
 // Initialize SMS if credentials are available
 function initSMS() {
-  aakashSmsToken = process.env.AAKASH_SMS_AUTH_TOKEN;
+  aakashSmsToken = db.getSetting('aakash_sms_auth_token', '') || process.env.AAKASH_SMS_AUTH_TOKEN;
   if (aakashSmsToken) {
     console.log('📱 Aakash SMS initialized successfully.');
+    printPublicIP();
     return true;
   } else {
     console.log('📱 Aakash SMS not configured — SMS notifications will be logged to console.');
@@ -170,4 +184,4 @@ function startScheduler() {
   }, 2000);
 }
 
-module.exports = { startScheduler, sendSMS, notifyMember, runDailyCheck };
+module.exports = { startScheduler, sendSMS, notifyMember, runDailyCheck, initSMS };
